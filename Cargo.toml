@@ -1,0 +1,15 @@
+[package]
+name = "zellij-keymap"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A Zellij plugin that displays keybindings with current mode awareness"
+repository = "https://github.com/Yon-Fandorin/zellij-keymap"
+
+[dependencies]
+zellij-tile = "0.43.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
