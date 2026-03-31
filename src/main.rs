@@ -31,8 +31,8 @@ enum ActionCategory {
     Copy,
     Session,
     Plugin,
-    ModeSwitching,
     Other,
+    ModeSwitching,
 }
 
 fn categorize_action(action: &Action) -> ActionCategory {
@@ -125,6 +125,12 @@ struct Binding {
     key_label: String,
     category: ActionCategory,
     direction_order: u8,
+}
+
+impl Binding {
+    fn is_mode_switch(&self) -> bool {
+        self.category == ActionCategory::ModeSwitching
+    }
 }
 
 fn direction_sort_order(actions: &[Action]) -> u8 {
@@ -541,14 +547,22 @@ impl State {
 
         let mut height = 0usize;
         for s in &self.sections {
-            if s.mode == self.current_mode || !self.collapsed.contains(&s.mode) {
+            let is_current = s.mode == self.current_mode;
+            if is_current || !self.collapsed.contains(&s.mode) {
+                let mut regular_count = 0usize;
                 let mut cats = 0usize;
                 let mut prev_cat: Option<ActionCategory> = None;
                 for b in &s.bindings {
+                    if b.is_mode_switch() { continue; }
                     if prev_cat.map_or(false, |pc| pc != b.category) { cats += 1; }
                     prev_cat = Some(b.category);
+                    regular_count += 1;
                 }
-                height += 1 + s.bindings.len() + cats;
+                height += 1 + regular_count + cats;
+                if is_current {
+                    let ms_count = s.bindings.len() - regular_count;
+                    height += ms_count;
+                }
             } else {
                 height += 1;
             }
@@ -827,12 +841,13 @@ impl State {
             let is_current = mode == self.current_mode;
             let is_collapsed = self.collapsed.contains(&mode) && !searching;
 
-            // Filter bindings if searching
+            // Filter bindings if searching; exclude mode-switching from non-current
             let filtered: Vec<&Binding> = if searching {
                 section.bindings.iter()
                     .filter(|b| {
-                        b.action_label.to_lowercase().contains(&query)
-                            || b.key_label.to_lowercase().contains(&query)
+                        (is_current || !b.is_mode_switch())
+                            && (b.action_label.to_lowercase().contains(&query)
+                                || b.key_label.to_lowercase().contains(&query))
                     })
                     .collect()
             } else {
@@ -847,7 +862,13 @@ impl State {
             header_indices.push(lines.len());
             let display_name = format_mode(mode).to_uppercase();
             let icon = mode_icon(mode);
-            let count = section.bindings.len();
+            let count = if is_current {
+                section.bindings.len()
+            } else {
+                section.bindings.iter()
+                    .filter(|b| !b.is_mode_switch())
+                    .count()
+            };
             let name_len = display_name.len();
 
             // Available width after gutter
@@ -887,12 +908,36 @@ impl State {
             );
             lines.push(RenderLine { text: header_text, line_type: lt });
 
-            // Bindings with grouping
-            let bindings_to_render: Vec<&Binding> = if searching {
-                filtered.into_iter().collect()
+            // Partition bindings: regular first, then mode-switching (current only)
+            let source: Vec<&Binding> = if searching {
+                filtered
             } else {
                 section.bindings.iter().collect()
             };
+            let (regular, mode_switch): (Vec<_>, Vec<_>) = source.into_iter()
+                .partition(|b| !b.is_mode_switch());
+
+            // For current mode: relabel mode-switching with "Mode " prefix
+            let mode_switch_owned: Vec<Binding> = if is_current {
+                mode_switch.iter().map(|b| {
+                    let name = b.action_label
+                        .trim_end_matches(" mode (all)")
+                        .trim_end_matches(" mode");
+                    Binding {
+                        action_label: format!("Mode {}", name),
+                        key_label: b.key_label.clone(),
+                        category: b.category,
+                        direction_order: b.direction_order,
+                    }
+                }).collect()
+            } else {
+                Vec::new()
+            };
+
+            let mut bindings_to_render: Vec<&Binding> = regular;
+            for b in &mode_switch_owned {
+                bindings_to_render.push(b);
+            }
 
             let available = cols.saturating_sub(GUTTER_WIDTH + 3);
             let content_width = (self.global_max_action + 4 + self.global_max_key).min(available);
