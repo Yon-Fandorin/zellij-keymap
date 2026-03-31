@@ -55,6 +55,13 @@ cargo build --release
 cp target/wasm32-wasip1/release/zellij-keymap.wasm ~/.config/zellij/plugins/zellij_keymap.wasm
 ```
 
+## TODO
+
+Improvements inspired by open zellij issues:
+
+- [ ] **Fuzzy search with `nucleo`** — Replace simple string matching with fzf-style fuzzy matching and matched-character highlighting ([zellij#2778](https://github.com/zellij-org/zellij/issues/2778))
+- [ ] **Command palette mode** — Allow executing an action directly from the search results, turning the viewer into a command palette ([zellij#2364](https://github.com/zellij-org/zellij/issues/2364))
+- [ ] **Keybinding collision detection** — Detect and highlight duplicate bindings within the same mode ([zellij#3724](https://github.com/zellij-org/zellij/issues/3724))
 ## License
 
 MIT
