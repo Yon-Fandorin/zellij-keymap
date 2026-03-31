@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use zellij_tile::prelude::*;
 use actions::{Action, SearchDirection, SearchOption};
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 
 const RESET: &str = "\x1b[0m";
@@ -819,7 +821,12 @@ impl State {
         };
         let cols = if self.cols > 0 { self.cols } else { 80 };
         let searching = !self.search_query.is_empty();
-        let query = self.search_query.to_lowercase();
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let pattern = if searching {
+            Some(Pattern::parse(&self.search_query, CaseMatching::Ignore, Normalization::Smart))
+        } else {
+            None
+        };
 
 
         let mut lines = Vec::new();
@@ -841,17 +848,23 @@ impl State {
             let is_current = mode == self.current_mode;
             let is_collapsed = self.collapsed.contains(&mode) && !searching;
 
-            // Filter bindings if searching; exclude mode-switching from non-current
-            let filtered: Vec<&Binding> = if searching {
-                section.bindings.iter()
-                    .filter(|b| {
-                        (is_current || !b.is_mode_switch())
-                            && (b.action_label.to_lowercase().contains(&query)
-                                || b.key_label.to_lowercase().contains(&query))
+            let filtered: Vec<(&Binding, Vec<u32>)> = if let Some(ref pat) = pattern {
+                let mut buf = Vec::new();
+                let mut indices = Vec::new();
+                let mut scored: Vec<(&Binding, u32, Vec<u32>)> = section.bindings.iter()
+                    .filter(|b| is_current || !b.is_mode_switch())
+                    .filter_map(|b| {
+                        let haystack = format!("{} {}", b.action_label, b.key_label);
+                        let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
+                        indices.clear();
+                        pat.indices(haystack_utf32, &mut matcher, &mut indices)
+                            .map(|score| (b, score, indices.clone()))
                     })
-                    .collect()
+                    .collect();
+                scored.sort_by(|a, b| b.1.cmp(&a.1));
+                scored.into_iter().map(|(b, _, idx)| (b, idx)).collect()
             } else {
-                section.bindings.iter().collect()
+                Vec::new()
             };
 
             if searching && filtered.is_empty() {
@@ -908,9 +921,11 @@ impl State {
             );
             lines.push(RenderLine { text: header_text, line_type: lt });
 
-            // Partition bindings: regular first, then mode-switching (current only)
+            let mut match_indices: BTreeMap<*const Binding, &Vec<u32>> = filtered.iter()
+                .map(|(b, idx)| (*b as *const Binding, idx))
+                .collect();
             let source: Vec<&Binding> = if searching {
-                filtered
+                filtered.iter().map(|(b, _)| *b).collect()
             } else {
                 section.bindings.iter().collect()
             };
@@ -933,6 +948,13 @@ impl State {
             } else {
                 Vec::new()
             };
+
+            // Map mode_switch_owned pointers to original binding's match indices
+            for (new_b, orig_b) in mode_switch_owned.iter().zip(mode_switch.iter()) {
+                if let Some(idx) = match_indices.get(&(*orig_b as *const Binding)).copied() {
+                    match_indices.insert(new_b as *const Binding, idx);
+                }
+            }
 
             let mut bindings_to_render: Vec<&Binding> = regular;
             for b in &mode_switch_owned {
@@ -1015,16 +1037,50 @@ impl State {
                     let used = action_chars + key_chars;
                     let gap = content_width.saturating_sub(used);
 
-                    let colored_key = color_key_label(key_display, &palette, is_current);
+                    let action_len = b.action_label.chars().count();
+                    let raw_indices = match_indices.get(&(*b as *const Binding));
+
+                    // Filter indices to skip truncated "…" and prefix-collapsed space regions
+                    let matched_set: Option<BTreeSet<u32>> = raw_indices.map(|idx| {
+                        let truncated = action_chars < action_len;
+                        let trunc_limit = if truncated { action_col.saturating_sub(1) } else { action_len };
+                        let prefix_skip = if bi > 0 && !common_prefix.is_empty() { prefix_chars } else { 0 };
+                        idx.iter().copied()
+                            .filter(|&i| {
+                                let pos = i as usize;
+                                pos >= action_len || (pos >= prefix_skip && pos < trunc_limit)
+                            })
+                            .collect()
+                    });
+
+                    let hl = fg_color(&palette.yellow);
+                    let fg = fg_color(&palette.fg);
+
+                    let colored_action = if let Some(ref ms) = matched_set {
+                        highlight_chars(&action_display, ms, 0, &hl, &fg)
+                    } else {
+                        format!("{}{}{}", fg, action_display, RESET)
+                    };
+
+                    let colored_key = if let Some(ref ms) = matched_set {
+                        let key_offset = action_len + 1;
+                        let key_len = key_display.chars().count();
+                        if (key_offset..key_offset + key_len).any(|i| ms.contains(&(i as u32))) {
+                            let bold_blue = format!("{}{}", if is_current { BOLD } else { "" }, fg_color(&palette.blue));
+                            highlight_chars(key_display, ms, key_offset, &hl, &bold_blue)
+                        } else {
+                            color_key_label(key_display, &palette, is_current)
+                        }
+                    } else {
+                        color_key_label(key_display, &palette, is_current)
+                    };
 
                     let line_text = format!(
-                        "{}{}{} {}{}{}{}{}",
+                        "{}{}{} {}{}{}",
                         bracket_color,
                         bracket,
                         RESET,
-                        fg_color(&palette.fg),
-                        action_display,
-                        RESET,
+                        colored_action,
                         " ".repeat(gap),
                         colored_key,
                     );
@@ -1036,7 +1092,6 @@ impl State {
                 }
             }
 
-            // Blank line after section
             lines.push(RenderLine {
                 text: String::new(),
                 line_type: LineType::Empty,
@@ -1460,6 +1515,33 @@ fn color_key_label(key: &str, palette: &Palette, bold: bool) -> String {
         .map(|g| color_single_key_group(g, palette, bold))
         .collect::<Vec<_>>()
         .join(&dimmed_sep)
+}
+
+/// Highlight matched characters in a display string.
+/// `matched` contains char positions in the original haystack.
+/// `offset` maps display position to haystack position.
+/// Toggles between `hl` (bold) and `normal` styles on matched/unmatched transitions.
+fn highlight_chars(display: &str, matched: &BTreeSet<u32>, offset: usize, hl: &str, normal: &str) -> String {
+    let mut out = String::new();
+    out.push_str(normal);
+    let mut in_hl = false;
+    for (i, ch) in display.chars().enumerate() {
+        let global = (i + offset) as u32;
+        if matched.contains(&global) {
+            if !in_hl {
+                out.push_str(hl);
+                out.push_str(BOLD);
+                in_hl = true;
+            }
+        } else if in_hl {
+            out.push_str(RESET);
+            out.push_str(normal);
+            in_hl = false;
+        }
+        out.push(ch);
+    }
+    out.push_str(RESET);
+    out
 }
 
 fn modifier_legend(style: &ModifierStyle, palette: &Palette) -> (String, usize) {
