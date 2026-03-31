@@ -1108,51 +1108,111 @@ fn parse_sections(keybinds: &KeybindsVec, style: &ModifierStyle) -> Vec<Section>
     sections
 }
 
-/// Merge two key labels with common prefix.
-/// e.g. "Alt+h" + "Alt+←" → "Alt+h/←"
-///      "Ctrl+d" + "Alt+d" → "Ctrl+d  Alt+d" (no common prefix)
-/// Split a key label into (modifier_prefix, bare_key) at the last separator.
-/// Tries "+", "-", then falls back to last single-char boundary for macOS style.
-/// Split "⌥ + h" into ("⌥ +", "h") — prefix includes up to last separator, bare is the key part.
+/// Split a key label into (modifier_prefix, bare_key) at the last " + " separator.
+/// e.g. "⌥ + h" → ("⌥", "h"), "⌥ + ⇧ + H" → ("⌥ + ⇧", "H"), "h" → ("", "h")
+/// Handles bare key "+" correctly: "⌥ + ⇧ + +" → ("⌥ + ⇧", "+")
+/// The prefix does NOT include the trailing separator.
 fn split_modifier_and_bare(s: &str) -> (String, String) {
-    // Find the last separator pattern: " + ", "+", " - ", "-"
-    for sep in [" + ", "+", " - ", "-"] {
-        if let Some(i) = s.rfind(sep) {
-            let prefix = s[..i + sep.len()].trim_end().to_string();
-            let bare = s[i + sep.len()..].trim_start().to_string();
-            return (prefix, bare);
+    // format_key always produces "mod + mod + key" with " + " separators.
+    // Split by " + " and the last element is the bare key.
+    let parts: Vec<&str> = s.split(" + ").collect();
+    if parts.len() <= 1 {
+        return (String::new(), s.to_string());
+    }
+    // Last non-empty part is bare key; if last is empty, the key itself is "+"
+    // e.g. "⌥ + ⇧ + +" splits to ["⌥", "⇧", "", ""] — bare is "+"
+    let last = parts[parts.len() - 1];
+    if !last.is_empty() {
+        let prefix = parts[..parts.len() - 1].join(" + ");
+        (prefix.trim_end().to_string(), last.trim_start().to_string())
+    } else {
+        // bare key is "+" — rejoin all but last two parts as prefix
+        if parts.len() >= 3 {
+            let prefix = parts[..parts.len() - 2].join(" + ");
+            (prefix.trim_end().to_string(), "+".to_string())
+        } else {
+            // just "+" by itself
+            (String::new(), "+".to_string())
         }
     }
-    (String::new(), s.to_string())
 }
 
-/// Merge two key labels with common modifier prefix.
+/// Key priority for display ordering: lower = displayed first.
+/// Letters come before arrows/special keys.
+fn bare_key_priority(bare: &str) -> u8 {
+    match bare.trim() {
+        s if s.chars().count() == 1 && s.chars().next().map_or(false, |c| c.is_ascii_alphanumeric()) => 0,
+        "␣" | "↵" | "⇥" | "Esc" | "⌫" => 1,
+        "←" | "→" | "↑" | "↓" => 2,
+        _ => 3,
+    }
+}
+
+/// Separator between different modifier groups in plain text (e.g. "Ctrl + d · Alt + d")
+const KEY_GROUP_SEP: &str = " · ";
+
+/// Parse a key label string into groups: Vec<(modifier_prefix, Vec<bare_key>)>
+fn parse_key_groups(label: &str) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for group in label.split(KEY_GROUP_SEP) {
+        let group = group.trim();
+        if group.is_empty() {
+            continue;
+        }
+        let (prefix, bare_part) = split_modifier_and_bare(group);
+        let bare_keys: Vec<String> = bare_part.split('/').map(|s| s.trim().to_string()).collect();
+        // Find existing group with same prefix
+        if let Some(g) = groups.iter_mut().find(|(p, _)| *p == prefix) {
+            for k in &bare_keys {
+                if !g.1.contains(k) {
+                    g.1.push(k.clone());
+                }
+            }
+        } else {
+            groups.push((prefix, bare_keys));
+        }
+    }
+    groups
+}
+
+/// Format parsed key groups back into a label string, sorted by priority within each group.
+fn format_key_groups(groups: &[(String, Vec<String>)]) -> String {
+    groups.iter()
+        .map(|(prefix, bare_keys)| {
+            let mut sorted: Vec<&str> = bare_keys.iter().map(|s| s.as_str()).collect();
+            sorted.sort_by_key(|k| bare_key_priority(k));
+            if prefix.is_empty() {
+                sorted.join("/")
+            } else {
+                format!("{} + {}", prefix, sorted.join("/"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(KEY_GROUP_SEP)
+}
+
+/// Merge two key labels, grouping by modifier prefix.
 /// e.g. "⌥ + h" + "⌥ + ←" → "⌥ + h/←"
-/// Skips if the new key is already present.
+///      "h/←" + "⌥ + h" → "h/← · ⌥ + h"
+/// Keys sorted within each group: letters first, then arrows/special.
 fn merge_key_labels(existing: &str, new: &str) -> String {
-    // Skip if exact duplicate
     if existing == new {
         return existing.to_string();
     }
 
-    let (prefix_b, bare_b) = split_modifier_and_bare(new);
+    let mut groups = parse_key_groups(existing);
+    let (prefix_new, bare_new) = split_modifier_and_bare(new);
 
-    // Check if bare_b already appears as a /-separated segment
-    if existing.split('/').any(|s| s.trim() == bare_b.trim()) {
-        return existing.to_string();
+    if let Some(g) = groups.iter_mut().find(|(p, _)| *p == prefix_new) {
+        let bare = bare_new.trim().to_string();
+        if !g.1.contains(&bare) {
+            g.1.push(bare);
+        }
+    } else {
+        groups.push((prefix_new, vec![bare_new.trim().to_string()]));
     }
 
-    let effective_prefix = if existing.contains('/') {
-        split_modifier_and_bare(existing.split('/').next().unwrap_or("")).0
-    } else {
-        split_modifier_and_bare(existing).0
-    };
-
-    if !effective_prefix.is_empty() && effective_prefix == prefix_b {
-        format!("{}/{}", existing, bare_b)
-    } else {
-        format!("{}  {}", existing, new)
-    }
+    format_key_groups(&groups)
 }
 
 
@@ -1373,25 +1433,33 @@ fn color_bare_keys(bare: &str, palette: &Palette, bold: bool) -> String {
         .join(&format!("{}/{}", fg, RESET))
 }
 
-/// Color key label: modifier parts in yellow, bare key in blue, "/" in dim
-fn color_key_label(key: &str, palette: &Palette, bold: bool) -> String {
-    let yellow = fg_color(&palette.yellow);
-
-    let parts: Vec<&str> = key.split(" + ").collect();
-    if parts.len() <= 1 {
-        return color_bare_keys(key, palette, bold);
+/// Color a single key group (one modifier combo): modifier parts in yellow, bare key in blue
+fn color_single_key_group(group: &str, palette: &Palette, bold: bool) -> String {
+    let (prefix, bare) = split_modifier_and_bare(group);
+    if prefix.is_empty() {
+        return color_bare_keys(&bare, palette, bold);
     }
-    let modifiers = &parts[..parts.len() - 1];
-    let bare = parts[parts.len() - 1];
 
-    let colored_mods: Vec<String> = modifiers.iter()
+    let yellow = fg_color(&palette.yellow);
+    let colored_mods: Vec<String> = prefix.split(" + ")
         .map(|m| format!("{}{}{}", yellow, m, RESET))
         .collect();
     format!(
         "{} + {}",
         colored_mods.join(&format!("{} + ", RESET)),
-        color_bare_keys(bare, palette, bold),
+        color_bare_keys(&bare, palette, bold),
     )
+}
+
+/// Color key label: modifier parts in yellow, bare key in blue, "/" in dim, "·" separator dimmed
+fn color_key_label(key: &str, palette: &Palette, bold: bool) -> String {
+    let groups: Vec<&str> = key.split(KEY_GROUP_SEP).collect();
+    let fg = fg_color(&palette.fg);
+    let dimmed_sep = format!("{} · {}", fg, RESET);
+    groups.iter()
+        .map(|g| color_single_key_group(g, palette, bold))
+        .collect::<Vec<_>>()
+        .join(&dimmed_sep)
 }
 
 fn modifier_legend(style: &ModifierStyle, palette: &Palette) -> (String, usize) {
