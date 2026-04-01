@@ -932,9 +932,8 @@ impl State {
             let (regular, mode_switch): (Vec<_>, Vec<_>) = source.into_iter()
                 .partition(|b| !b.is_mode_switch());
 
-            // For current mode: relabel mode-switching with "Mode " prefix
             let mode_switch_owned: Vec<Binding> = if is_current {
-                mode_switch.iter().map(|b| {
+                let mut owned: Vec<Binding> = mode_switch.iter().map(|b| {
                     let name = b.action_label
                         .trim_end_matches(" mode (all)")
                         .trim_end_matches(" mode");
@@ -944,7 +943,9 @@ impl State {
                         category: b.category,
                         direction_order: b.direction_order,
                     }
-                }).collect()
+                }).collect();
+                owned.sort_by_key(|b| mode_sort_order(&b.action_label));
+                owned
             } else {
                 Vec::new()
             };
@@ -1430,6 +1431,23 @@ fn format_action(action: &Action) -> String {
     }
 }
 
+
+fn mode_sort_order(label: &str) -> u8 {
+    let name = label.strip_prefix("Mode ").unwrap_or(label);
+    match name {
+        "Normal"  => 0,
+        "Pane"    => 1,
+        "Tab"     => 2,
+        "Resize"  => 3,
+        "Move"    => 4,
+        "Scroll"  => 5,
+        "Search"  => 6,
+        "Session" => 7,
+        "Tmux"    => 8,
+        "Locked"  => 9,
+        _ => 10,
+    }
+}
 
 fn format_mode(mode: InputMode) -> String {
     match mode {
