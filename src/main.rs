@@ -149,6 +149,14 @@ fn direction_sort_order(actions: &[Action]) -> u8 {
             }
             Action::ScrollUp | Action::PageScrollUp | Action::HalfPageScrollUp => return 2,
             Action::ScrollDown | Action::PageScrollDown | Action::HalfPageScrollDown => return 1,
+            // Tab navigation: values spaced with gaps > 5 to trigger
+            // visual sub-grouping in the FocusTab render logic.
+            // 10-11: next/prev, 20-234: numbered tabs, 240: named, 250: toggle
+            Action::GoToNextTab => return 10,
+            Action::GoToPreviousTab => return 11,
+            Action::GoToTab(n) => return 20 + ((*n).min(214) as u8),
+            Action::GoToTabName(..) => return 240,
+            Action::ToggleTab => return 250,
             _ => {}
         }
     }
@@ -966,20 +974,25 @@ impl State {
             let content_width = (self.global_max_action + 4 + self.global_max_key).min(available);
             let action_col = self.global_max_action.min(available.saturating_sub(self.global_max_key + 4));
 
-            // Split bindings into groups by category
+            // Split bindings into groups by category.
+            // Within FocusTab, also split on direction_order gap > 5 to
+            // separate directional focus, next/prev, tab numbers, and toggle.
             let mut groups: Vec<Vec<&Binding>> = Vec::new();
             let mut current_group: Vec<&Binding> = Vec::new();
             let mut prev_cat: Option<ActionCategory> = None;
+            let mut prev_dir: u8 = 0;
             for b in &bindings_to_render {
                 if let Some(pc) = prev_cat {
-                    if pc != b.category {
-                        if !current_group.is_empty() {
-                            groups.push(current_group);
-                            current_group = Vec::new();
-                        }
+                    let new_group = pc != b.category
+                        || (pc == ActionCategory::FocusTab
+                            && b.direction_order.abs_diff(prev_dir) > 5);
+                    if new_group && !current_group.is_empty() {
+                        groups.push(current_group);
+                        current_group = Vec::new();
                     }
                 }
                 prev_cat = Some(b.category);
+                prev_dir = b.direction_order;
                 current_group.push(b);
             }
             if !current_group.is_empty() {
